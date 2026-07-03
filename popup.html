@@ -1,0 +1,320 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Pinpoint</title>
+    <style>
+        *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+        :root {
+            --bg:      #0f0f13;
+            --surface: #1a1a24;
+            --border:  #2a2a3a;
+            --accent:  #6c47ff;
+            --accent2: #a78bfa;
+            --text:    #e8e8f0;
+            --muted:   #7a7a9a;
+            --green:   #22c55e;
+            --red:     #f87171;
+            --radius:  10px;
+        }
+
+        body {
+            width: 380px;
+            min-height: 200px;
+            max-height: 600px;
+            overflow-y: auto;
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            font-size: 13px;
+        }
+
+        /* ── Header ── */
+        .header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 14px 16px 12px;
+            border-bottom: 1px solid var(--border);
+            position: sticky;
+            top: 0;
+            background: var(--bg);
+            z-index: 10;
+        }
+
+        .logo {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 700;
+            font-size: 15px;
+            letter-spacing: -0.3px;
+        }
+
+        .logo-dot {
+            width: 10px; height: 10px;
+            border-radius: 50%;
+            background: var(--accent);
+            box-shadow: 0 0 10px var(--accent);
+        }
+
+        #scanBtn {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: var(--accent);
+            color: #fff;
+            border: none;
+            border-radius: 7px;
+            padding: 7px 14px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: opacity 0.15s, transform 0.1s;
+        }
+        #scanBtn:hover  { opacity: 0.9; }
+        #scanBtn:active { transform: scale(0.97); }
+        #scanBtn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+        /* ── Toolbar (sort + filter) ── */
+        .toolbar {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 16px;
+            border-bottom: 1px solid var(--border);
+            background: var(--bg);
+            position: sticky;
+            top: 49px;
+            z-index: 9;
+        }
+
+        .toolbar select {
+            flex: 1;
+            background: var(--surface);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 5px 8px;
+            font-size: 11px;
+            cursor: pointer;
+            outline: none;
+        }
+
+        .filter-label {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            font-size: 11px;
+            color: var(--muted);
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .filter-label input[type="checkbox"] {
+            accent-color: var(--accent);
+            width: 13px;
+            height: 13px;
+            cursor: pointer;
+        }
+
+        /* ── States ── */
+        #state-idle, #state-loading, #state-error, #state-results { display: none; }
+        #state-idle { display: block; }
+
+        .state-box {
+            padding: 32px 20px;
+            text-align: center;
+            color: var(--muted);
+            line-height: 1.6;
+        }
+        .state-box .icon { font-size: 32px; margin-bottom: 10px; }
+
+        /* ── Spinner ── */
+        .spinner-wrap {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 14px;
+            padding: 40px 20px;
+        }
+        .spinner {
+            width: 36px; height: 36px;
+            border: 3px solid var(--border);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.75s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .step-label { font-size: 12px; color: var(--muted); }
+
+        /* ── Results ── */
+        .results-header {
+            padding: 8px 16px 6px;
+            font-size: 11px;
+            color: var(--muted);
+            text-transform: uppercase;
+            letter-spacing: 0.8px;
+        }
+
+        .product-list { padding: 4px 0; }
+
+        .product-card {
+            display: flex;
+            gap: 12px;
+            align-items: flex-start;
+            padding: 10px 16px;
+            border-bottom: 1px solid var(--border);
+            text-decoration: none;
+            color: inherit;
+            transition: background 0.12s;
+        }
+        .product-card:hover  { background: var(--surface); }
+        .product-card:last-child { border-bottom: none; }
+
+        .product-thumb {
+            width: 62px; height: 62px;
+            object-fit: cover;
+            border-radius: 7px;
+            border: 1px solid var(--border);
+            flex-shrink: 0;
+            background: var(--surface);
+        }
+
+        .product-info { flex: 1; min-width: 0; }
+
+        .product-title {
+            font-size: 12px;
+            font-weight: 600;
+            line-height: 1.4;
+            margin-bottom: 2px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .product-source {
+            font-size: 11px;
+            color: var(--muted);
+            margin-bottom: 5px;
+        }
+
+        .product-footer {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+
+        .product-price {
+            font-size: 12px;
+            font-weight: 700;
+            color: var(--green);
+        }
+
+        .out-of-stock {
+            font-size: 11px;
+            color: var(--red);
+        }
+
+        .price-unknown {
+            font-size: 11px;
+            color: var(--muted);
+            font-style: italic;
+        }
+
+        .score-badge {
+            font-size: 10px;
+            font-weight: 700;
+            padding: 2px 6px;
+            border-radius: 4px;
+            background: color-mix(in srgb, var(--accent) 18%, transparent);
+            color: var(--accent2);
+        }
+
+        /* ── Error ── */
+        .error-box { padding: 28px 20px; text-align: center; }
+        .error-icon { font-size: 28px; margin-bottom: 10px; }
+        .error-msg { font-size: 12px; color: var(--red); margin-bottom: 14px; line-height: 1.5; }
+        .retry-btn {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text);
+            border-radius: 6px;
+            padding: 6px 14px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .retry-btn:hover { background: var(--surface); }
+
+        ::-webkit-scrollbar { width: 5px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+    </style>
+</head>
+<body>
+
+    <div class="header">
+        <div class="logo">
+            <div class="logo-dot"></div>
+            Pinpoint
+        </div>
+        <button id="scanBtn">&#9654; Scan clothing</button>
+    </div>
+
+    <!-- Sort + filter toolbar (only shown in results state) -->
+    <div class="toolbar" id="toolbar" style="display:none">
+        <select id="sortSelect">
+            <option value="match">Sort: Best match</option>
+            <option value="price_asc">Sort: Price low → high</option>
+            <option value="price_desc">Sort: Price high → low</option>
+        </select>
+        <label class="filter-label">
+            <input type="checkbox" id="priceFilter">
+            Priced only
+        </label>
+    </div>
+
+    <!-- Idle -->
+    <div id="state-idle">
+        <div class="state-box">
+            <div class="icon">👕</div>
+            <p>Draw a box around any clothing item<br>on the page to find similar products.</p>
+        </div>
+    </div>
+
+    <!-- Loading -->
+    <div id="state-loading">
+        <div class="spinner-wrap">
+            <div class="spinner"></div>
+            <div class="step-label" id="stepLabel">Uploading image…</div>
+        </div>
+    </div>
+
+    <!-- Error -->
+    <div id="state-error">
+        <div class="error-box">
+            <div class="error-icon">⚠️</div>
+            <div class="error-msg" id="errorMsg">Something went wrong.</div>
+            <button class="retry-btn" id="retryBtn">Try again</button>
+        </div>
+    </div>
+
+    <!-- Results -->
+    <div id="state-results">
+        <div class="results-header" id="resultsHeader">Results</div>
+        <div class="product-list" id="productList"></div>
+    </div>
+
+    <script src="popup.js"></script>
+    <script>
+        // Show/hide toolbar when results are visible
+        const observer = new MutationObserver(() => {
+            const resultsVisible = document.getElementById("state-results").style.display !== "none";
+            document.getElementById("toolbar").style.display = resultsVisible ? "flex" : "none";
+        });
+        observer.observe(document.getElementById("state-results"), { attributes: true, attributeFilter: ["style"] });
+    </script>
+</body>
+</html>
