@@ -3,6 +3,7 @@ import re
 import json
 import httpx
 import base64
+import hashlib
 import asyncio
 import cloudinary
 import cloudinary.uploader
@@ -13,6 +14,9 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
 import logging
+from contextlib import asynccontextmanager
+
+import db
 
 logging.basicConfig(level=logging.INFO)
 load_dotenv()
@@ -35,7 +39,13 @@ AI_BATCH_SIZE = 8          # candidates per Gemini vision call
 MAX_AI_CANDIDATES = 30     # cap how many of the (up to 60) candidates get AI-scored
 GEMINI_MODEL = "gemini-1.5-flash"
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    await db.init_db()
+    yield
+
+
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -323,6 +333,19 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/history")
+async def get_history(limit: int = 50):
+    return await db.list_history(limit)
+
+
+@app.get("/history/{item_id}")
+async def get_history_item(item_id: int):
+    item = await db.get_history_item(item_id)
+    if item is None:
+        raise HTTPException(404, "History item not found")
+    return item
+
+
 @app.post("/search", response_model=list[Product])
 async def search(req: SearchRequest):
     if not req.image.startswith("data:image"):
@@ -331,6 +354,17 @@ async def search(req: SearchRequest):
     country = (req.country or "us").lower().strip()
     serpapi_country, hl, allowed_symbols = COUNTRY_CONFIG.get(country, DEFAULT_CONFIG)
     logging.info(f"Country: {country} → SerpApi country={serpapi_country}, hl={hl}, symbols={allowed_symbols}")
+
+    # 0. Cache lookup — an identical crop searched again in the last hour skips
+    #    Cloudinary/SerpApi/scraping/Gemini entirely
+    image_hash = hashlib.sha256(req.image.encode()).hexdigest()
+    cached = await db.get_cached_search(image_hash, country)
+    if cached is not None:
+        logging.info(f"✅ Cache hit for {image_hash[:12]}… ({country})")
+        await db.log_search_history(
+            image_hash, country, cached["query_image_url"], cached["products"], cache_hit=True
+        )
+        return cached["products"]
 
     # 1. Cloudinary
     try:
@@ -402,5 +436,9 @@ async def search(req: SearchRequest):
     with_price    = [p for p in products if p["price_value"] is not None]
     without_price = [p for p in products if p["price_value"] is None]
     logging.info(f"✅ {len(with_price)} with price, {len(without_price)} without")
+
+    # 8. Cache this result and log it to search history
+    await db.save_search_cache(image_hash, country, public_url, products)
+    await db.log_search_history(image_hash, country, public_url, products, cache_hit=False)
 
     return products
