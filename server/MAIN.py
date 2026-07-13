@@ -6,6 +6,7 @@ import base64
 import asyncio
 import cloudinary
 import cloudinary.uploader
+import google.generativeai as genai
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -25,6 +26,14 @@ cloudinary.config(
 )
 
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+AI_BATCH_SIZE = 8          # candidates per Gemini vision call
+MAX_AI_CANDIDATES = 30     # cap how many of the (up to 60) candidates get AI-scored
+GEMINI_MODEL = "gemini-1.5-flash"
 
 app = FastAPI()
 app.add_middleware(
@@ -222,6 +231,91 @@ async def enrich_prices(products: list[dict], allowed_symbols: list[str]) -> lis
     return list(await asyncio.gather(*[fetch_one(p) for p in products]))
 
 
+def parse_data_url(data_url: str) -> tuple[str, bytes]:
+    header, _, encoded = data_url.partition(",")
+    mime = header.split(":")[1].split(";")[0] if ":" in header else "image/png"
+    return mime, base64.b64decode(encoded)
+
+
+async def fetch_image_bytes(url: str, client: httpx.AsyncClient) -> tuple[str, bytes] | None:
+    try:
+        resp = await client.get(url, timeout=8, follow_redirects=True)
+        if resp.status_code != 200:
+            return None
+        mime = resp.headers.get("content-type", "image/jpeg").split(";")[0]
+        if not mime.startswith("image"):
+            mime = "image/jpeg"
+        return mime, resp.content
+    except Exception:
+        return None
+
+
+SIMILARITY_PROMPT = (
+    "You are comparing a QUERY clothing image to several CANDIDATE product images. "
+    "For each candidate, rate visual similarity to the query image from 0.0 (not similar) "
+    "to 1.0 (nearly identical), based on garment type, color, pattern, and cut. "
+    'Respond ONLY with JSON in this exact shape: '
+    '{"scores": [{"index": <candidate index>, "score": <0.0-1.0>}, ...]}'
+)
+
+
+async def score_batch(query_part: dict, batch: list[dict], client: httpx.AsyncClient) -> None:
+    """Score one batch of products in place. On any failure, leaves the existing
+    rank-based fallback score untouched rather than failing the request."""
+    try:
+        fetched = await asyncio.gather(*[fetch_image_bytes(p["thumbnail"], client) for p in batch])
+
+        parts = [SIMILARITY_PROMPT, "QUERY image:", query_part]
+
+        indexed_batch = []
+        for i, (p, fetched_img) in enumerate(zip(batch, fetched), start=1):
+            if fetched_img is None:
+                continue
+            mime, data = fetched_img
+            parts.append(f"CANDIDATE {i}:")
+            parts.append({"mime_type": mime, "data": data})
+            indexed_batch.append((i, p))
+
+        if not indexed_batch:
+            return
+
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        resp = await model.generate_content_async(
+            parts, generation_config={"response_mime_type": "application/json"}
+        )
+        parsed = json.loads(resp.text)
+        score_by_index = {int(s["index"]): float(s["score"]) for s in parsed.get("scores", [])}
+
+        for i, p in indexed_batch:
+            if i in score_by_index:
+                p["similarity_score"] = max(0.0, min(1.0, score_by_index[i]))
+    except Exception as e:
+        logging.warning(f"⚠️  Gemini similarity batch failed, keeping fallback scores: {e}")
+
+
+async def score_similarity_with_gemini(query_image: str, products: list[dict]) -> None:
+    """AI-score the top MAX_AI_CANDIDATES products in place using Gemini Vision.
+    Remaining products, and any that fail, keep their rank-based fallback score."""
+    if not GEMINI_API_KEY or not products:
+        return
+
+    scoreable = products[:MAX_AI_CANDIDATES]
+    logging.info(f"🤖 AI-scoring {len(scoreable)} of {len(products)} candidates")
+
+    query_mime, query_bytes = parse_data_url(query_image)
+    query_part = {"mime_type": query_mime, "data": query_bytes}
+
+    sem = asyncio.Semaphore(3)
+
+    async def run_batch(batch: list[dict], client: httpx.AsyncClient):
+        async with sem:
+            await score_batch(query_part, batch, client)
+
+    async with httpx.AsyncClient() as client:
+        batches = [scoreable[i:i + AI_BATCH_SIZE] for i in range(0, len(scoreable), AI_BATCH_SIZE)]
+        await asyncio.gather(*[run_batch(b, client) for b in batches])
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.get("/health")
@@ -290,12 +384,20 @@ async def search(req: SearchRequest):
             "in_stock":         in_stock,
         })
 
-    # 5. Scrape prices for products missing them (region-aware)
-    products = await enrich_prices(products, allowed_symbols)
+    # 5. Scrape prices + AI-score similarity concurrently — independent I/O passes
+    #    over the same product dicts, touching different keys, so safe to run together
+    products, _ = await asyncio.gather(
+        enrich_prices(products, allowed_symbols),
+        score_similarity_with_gemini(req.image, products),
+    )
 
     # 6. Add numeric price_value for frontend sorting
     for p in products:
         p["price_value"] = parse_price_value(p.get("price"))
+
+    # 7. AI scores aren't guaranteed to follow SerpApi's original order — sort
+    #    explicitly so the popup's "Best match" sort (which trusts server order) holds
+    products.sort(key=lambda p: p["similarity_score"], reverse=True)
 
     with_price    = [p for p in products if p["price_value"] is not None]
     without_price = [p for p in products if p["price_value"] is None]
