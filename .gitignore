@@ -4,3 +4,5 @@ __pycache__/
 server/.env
 *.db
 .DS_Store
+popup/node_modules/
+popup/dist/
