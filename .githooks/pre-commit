@@ -1,0 +1,19 @@
+#!/bin/sh
+# Blocks commits that stage a secrets-shaped file (the exact mistake that
+# leaked this project's API keys once already). Bypass with --no-verify
+# only if you're certain the file doesn't belong in git.
+
+staged=$(git diff --cached --name-only)
+
+pattern='(^|/)\.env(\..*)?$|\.pem$|\.pfx$|(^|/)id_rsa$|credentials.*\.json$'
+
+offenders=$(echo "$staged" | grep -E "$pattern")
+
+if [ -n "$offenders" ]; then
+    echo "pre-commit: refusing to commit likely secret file(s):"
+    echo "$offenders" | sed 's/^/  /'
+    echo "If this is a false positive, use: git commit --no-verify"
+    exit 1
+fi
+
+exit 0
