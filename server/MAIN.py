@@ -146,8 +146,16 @@ async def search_serpapi(image_url: str, serpapi_country: str, hl: str) -> list[
     return matches[:60]
 
 
-async def scrape_price(url: str, client: httpx.AsyncClient, allowed_symbols: list[str]) -> str | None:
-    """Scrape product page for a price matching the user's region currency."""
+async def scrape_price(
+    url: str, client: httpx.AsyncClient, allowed_symbols: list[str]
+) -> tuple[str | None, bool]:
+    """Scrape product page for a price matching the user's region currency.
+
+    Returns (price_or_None, page_reachable). page_reachable is False when the
+    request itself failed (bad status, timeout, connection error) as opposed
+    to the page loading fine but simply not containing a parseable price --
+    callers use this to distinguish "no price found" from "this link is dead".
+    """
     try:
         headers = {
             "User-Agent": (
@@ -159,7 +167,7 @@ async def scrape_price(url: str, client: httpx.AsyncClient, allowed_symbols: lis
         }
         resp = await client.get(url, headers=headers, timeout=8, follow_redirects=True)
         if resp.status_code != 200:
-            return None
+            return None, False
 
         html = resp.text
         soup = BeautifulSoup(html, "html.parser")
@@ -177,37 +185,36 @@ async def scrape_price(url: str, client: httpx.AsyncClient, allowed_symbols: lis
                         price = str(offers.get("price") or offers.get("lowPrice") or "")
                         currency = offers.get("priceCurrency", "")
                         if price and price_matches_region(f"{currency} {price}", allowed_symbols):
-                            return f"{currency} {price}".strip()
+                            return f"{currency} {price}".strip(), True
                     elif isinstance(offers, list) and offers:
                         price = str(offers[0].get("price") or "")
                         currency = offers[0].get("priceCurrency", "")
                         if price and price_matches_region(f"{currency} {price}", allowed_symbols):
-                            return f"{currency} {price}".strip()
+                            return f"{currency} {price}".strip(), True
             except Exception:
                 continue
 
-        # 2. Regex — only match currency symbols for this region
+        # 2. Regex — only match currency symbols for this region. Walk each
+        # distinct match (not just the first one, repeatedly) until one looks
+        # like a plausible price.
         sym_pattern = "|".join(re.escape(s) for s in allowed_symbols)
         price_pattern = re.compile(
             rf'({sym_pattern})\s*[\d,]+(?:\.\d{{1,2}})?',
             re.IGNORECASE
         )
-        matches_found = price_pattern.findall(html)
-        for m in matches_found[:10]:
-            full = price_pattern.search(html)
-            if full:
-                candidate = full.group(0).strip()
-                digits = re.sub(r'[^\d.]', '', candidate)
-                try:
-                    if 1 < float(digits) < 500000:
-                        return candidate
-                except Exception:
-                    continue
+        for match in list(price_pattern.finditer(html))[:10]:
+            candidate = match.group(0).strip()
+            digits = re.sub(r'[^\d.]', '', candidate)
+            try:
+                if 1 < float(digits) < 500000:
+                    return candidate, True
+            except Exception:
+                continue
 
-        return None
+        return None, True
     except Exception as e:
         logging.debug(f"Price scrape failed for {url}: {e}")
-        return None
+        return None, False
 
 
 def parse_price_value(price_str: str | None) -> float | None:
@@ -230,10 +237,13 @@ async def enrich_prices(products: list[dict], allowed_symbols: list[str]) -> lis
             return p
         async with sem:
             async with httpx.AsyncClient() as client:
-                scraped = await scrape_price(p["link"], client, allowed_symbols)
+                scraped, reachable = await scrape_price(p["link"], client, allowed_symbols)
                 if scraped:
                     p["price"] = scraped
                     logging.info(f"✅ Scraped price for {p['source']}: {scraped}")
+                elif not reachable:
+                    p["_unreachable"] = True
+                    logging.info(f"🚫 Dropping unreachable link for {p['source']} — {p['link'][:60]}")
                 else:
                     logging.info(f"⚠️  No price found for {p['source']} — {p['link'][:60]}")
         return p
@@ -424,6 +434,13 @@ async def search(req: SearchRequest):
         enrich_prices(products, allowed_symbols),
         score_similarity_with_gemini(req.image, products),
     )
+
+    # 5b. Drop products whose link was confirmed dead during price scraping —
+    #     a result that fails to load isn't useful regardless of match score
+    dropped = sum(1 for p in products if p.get("_unreachable"))
+    products = [p for p in products if not p.pop("_unreachable", False)]
+    if dropped:
+        logging.info(f"🚫 Dropped {dropped} unreachable-link product(s)")
 
     # 6. Add numeric price_value for frontend sorting
     for p in products:
