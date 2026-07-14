@@ -8,8 +8,9 @@ import asyncio
 import cloudinary
 import cloudinary.uploader
 import google.generativeai as genai
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from bs4 import BeautifulSoup
@@ -103,20 +104,49 @@ class Product(BaseModel):
 def is_blocked(link: str) -> bool:
     try:
         from urllib.parse import urlparse
-        host = urlparse(link).netloc.lower().lstrip("www.")
+        host = urlparse(link).netloc.lower().removeprefix("www.")
         return any(host == d or host.endswith("." + d) for d in BLOCKED_DOMAINS)
     except Exception:
         return False
 
 
 def price_matches_region(price_str: str, allowed_symbols: list[str]) -> bool:
-    """Return True if price string contains one of the allowed currency symbols."""
+    """Return True if price string contains one of the allowed currency symbols.
+
+    Symbols are matched only when not immediately preceded by a letter, so a
+    bare "$" (US) doesn't false-positive match inside a compound symbol like
+    "A$" (AUD), "C$" (CAD), or "S$" (SGD).
+    """
     if not price_str:
         return False
     for sym in allowed_symbols:
-        if sym in price_str:
+        if re.search(rf'(?<![A-Za-z]){re.escape(sym)}', price_str):
             return True
     return False
+
+
+def classify_serpapi_error(status_code: int | None, body: str) -> str:
+    """Turn a SerpApi failure into a specific, actionable message instead of a
+    raw exception string. Shapes verified against SerpApi's documented error
+    codes (https://serpapi.com/api-status-and-error-codes)."""
+    lower_body = (body or "").lower()
+    if status_code == 429 or "run out of searches" in lower_body:
+        return "SerpApi's search quota is used up for this billing period. Try again next month or upgrade your plan."
+    if status_code == 401 or "invalid api key" in lower_body:
+        return "SerpApi credentials are invalid. Check SERPAPI_KEY in server/.env."
+    if status_code == 503:
+        return "SerpApi is temporarily unavailable. Please try again in a moment."
+    return "Visual search service failed. Please try again."
+
+
+def classify_cloudinary_error(message: str) -> str:
+    """Turn a Cloudinary upload failure into a specific, actionable message."""
+    lower_message = (message or "").lower()
+    if "permission" in lower_message or "forbidden" in lower_message:
+        return "Cloudinary key lacks upload permission. Check the API key's role in the Cloudinary dashboard."
+    if "invalid" in lower_message or "credential" in lower_message or "authenticat" in lower_message:
+        return "Cloudinary credentials are invalid. Check CLOUDINARY_* values in server/.env."
+    return "Image upload service failed. Please try again."
 
 
 def upload_to_cloudinary(data_url: str) -> str:
@@ -124,6 +154,13 @@ def upload_to_cloudinary(data_url: str) -> str:
         data_url, folder="pinpoint", resource_type="image"
     )
     return result["secure_url"]
+
+
+class SerpApiError(Exception):
+    def __init__(self, status_code: int | None, body: str):
+        self.status_code = status_code
+        self.body = body
+        super().__init__(f"SerpApi error {status_code}: {body[:200]}")
 
 
 async def search_serpapi(image_url: str, serpapi_country: str, hl: str) -> list[dict]:
@@ -136,7 +173,8 @@ async def search_serpapi(image_url: str, serpapi_country: str, hl: str) -> list[
     }
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get("https://serpapi.com/search", params=params)
-        resp.raise_for_status()
+        if resp.status_code != 200:
+            raise SerpApiError(resp.status_code, resp.text)
         data = resp.json()
 
     # Log full raw response so we can see what SerpApi actually returns
@@ -144,6 +182,54 @@ async def search_serpapi(image_url: str, serpapi_country: str, hl: str) -> list[
     matches = data.get("visual_matches") or data.get("shopping_results") or []
     logging.info(f"SerpApi raw sample (first 3): {json.dumps(matches[:3], indent=2)}")
     return matches[:60]
+
+
+def extract_price_from_html(html: str, allowed_symbols: list[str]) -> str | None:
+    """Given a product page's raw HTML, find a price matching the user's region
+    currency: first via JSON-LD structured data, then a regex fallback that
+    walks every distinct currency-shaped match until one looks plausible."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. JSON-LD
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(tag.string or "")
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                offers = item.get("offers") or item.get("Offers")
+                if isinstance(offers, dict):
+                    price = str(offers.get("price") or offers.get("lowPrice") or "")
+                    currency = offers.get("priceCurrency", "")
+                    if price and price_matches_region(f"{currency} {price}", allowed_symbols):
+                        return f"{currency} {price}".strip()
+                elif isinstance(offers, list) and offers:
+                    price = str(offers[0].get("price") or "")
+                    currency = offers[0].get("priceCurrency", "")
+                    if price and price_matches_region(f"{currency} {price}", allowed_symbols):
+                        return f"{currency} {price}".strip()
+        except Exception:
+            continue
+
+    # 2. Regex — only match currency symbols for this region. Walk each
+    # distinct match (not just the first one, repeatedly) until one looks
+    # like a plausible price.
+    sym_pattern = "|".join(re.escape(s) for s in allowed_symbols)
+    price_pattern = re.compile(
+        rf'({sym_pattern})\s*[\d,]+(?:\.\d{{1,2}})?',
+        re.IGNORECASE
+    )
+    for match in list(price_pattern.finditer(html))[:10]:
+        candidate = match.group(0).strip()
+        digits = re.sub(r'[^\d.]', '', candidate)
+        try:
+            if 1 < float(digits) < 500000:
+                return candidate
+        except Exception:
+            continue
+
+    return None
 
 
 async def scrape_price(
@@ -169,49 +255,7 @@ async def scrape_price(
         if resp.status_code != 200:
             return None, False
 
-        html = resp.text
-        soup = BeautifulSoup(html, "html.parser")
-
-        # 1. JSON-LD
-        for tag in soup.find_all("script", type="application/ld+json"):
-            try:
-                data = json.loads(tag.string or "")
-                items = data if isinstance(data, list) else [data]
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    offers = item.get("offers") or item.get("Offers")
-                    if isinstance(offers, dict):
-                        price = str(offers.get("price") or offers.get("lowPrice") or "")
-                        currency = offers.get("priceCurrency", "")
-                        if price and price_matches_region(f"{currency} {price}", allowed_symbols):
-                            return f"{currency} {price}".strip(), True
-                    elif isinstance(offers, list) and offers:
-                        price = str(offers[0].get("price") or "")
-                        currency = offers[0].get("priceCurrency", "")
-                        if price and price_matches_region(f"{currency} {price}", allowed_symbols):
-                            return f"{currency} {price}".strip(), True
-            except Exception:
-                continue
-
-        # 2. Regex — only match currency symbols for this region. Walk each
-        # distinct match (not just the first one, repeatedly) until one looks
-        # like a plausible price.
-        sym_pattern = "|".join(re.escape(s) for s in allowed_symbols)
-        price_pattern = re.compile(
-            rf'({sym_pattern})\s*[\d,]+(?:\.\d{{1,2}})?',
-            re.IGNORECASE
-        )
-        for match in list(price_pattern.finditer(html))[:10]:
-            candidate = match.group(0).strip()
-            digits = re.sub(r'[^\d.]', '', candidate)
-            try:
-                if 1 < float(digits) < 500000:
-                    return candidate, True
-            except Exception:
-                continue
-
-        return None, True
+        return extract_price_from_html(resp.text, allowed_symbols), True
     except Exception as e:
         logging.debug(f"Price scrape failed for {url}: {e}")
         return None, False
@@ -338,6 +382,17 @@ async def score_similarity_with_gemini(query_image: str, products: list[dict]) -
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    """Safety net so nothing unhandled ever reaches the client as a raw or
+    empty response — the real error is still logged server-side."""
+    logging.error(f"Unhandled error on {request.method} {request.url.path}", exc_info=exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Something went wrong on our end. Please try again."},
+    )
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -381,14 +436,19 @@ async def search(req: SearchRequest):
         public_url = upload_to_cloudinary(req.image)
         logging.info(f"✅ Cloudinary: {public_url}")
     except Exception as e:
-        raise HTTPException(500, f"Cloudinary upload failed: {e}")
+        logging.exception("Cloudinary upload failed")
+        raise HTTPException(500, classify_cloudinary_error(str(e)))
 
     # 2. SerpApi
     try:
         candidates = await search_serpapi(public_url, serpapi_country, hl)
         logging.info(f"✅ SerpApi: {len(candidates)} raw candidates")
+    except SerpApiError as e:
+        logging.exception("SerpApi search failed")
+        raise HTTPException(502, classify_serpapi_error(e.status_code, e.body))
     except Exception as e:
-        raise HTTPException(502, f"SerpApi search failed: {e}")
+        logging.exception("SerpApi search failed")
+        raise HTTPException(502, classify_serpapi_error(None, str(e)))
 
     if not candidates:
         return []

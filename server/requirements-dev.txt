@@ -1,0 +1,4 @@
+-r Requirements.txt
+pytest
+pytest-asyncio
+pytest-httpx

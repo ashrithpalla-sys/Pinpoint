@@ -55,8 +55,16 @@ chrome.runtime.onMessage.addListener(
                 });
 
                 if (!resp.ok) {
-                    const err = await resp.text();
-                    throw new Error(`Server error ${resp.status}: ${err}`);
+                    // Backend sends {"detail": "specific, actionable message"} —
+                    // fall back to raw text only if the body isn't JSON
+                    let message;
+                    try {
+                        const errJson = await resp.json();
+                        message = errJson.detail || JSON.stringify(errJson);
+                    } catch {
+                        message = await resp.text();
+                    }
+                    throw new Error(message);
                 }
 
                 const products = await resp.json();
