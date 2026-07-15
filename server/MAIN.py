@@ -212,15 +212,23 @@ def extract_price_from_html(html: str, allowed_symbols: list[str]) -> str | None
         except Exception:
             continue
 
-    # 2. Regex — only match currency symbols for this region. Walk each
-    # distinct match (not just the first one, repeatedly) until one looks
-    # like a plausible price.
+    # 2. Regex — only match currency symbols for this region, and only within
+    # visible text. Minified JS bundles routinely contain "$"-shaped patterns
+    # that aren't prices at all (e.g. ".replace(x, \"$1$2\")" regex-backreference
+    # syntax, or minified property names like "re.$5") -- scanning raw HTML
+    # (including <script>/<style> contents) picks these up as false prices, so
+    # strip them out first. Walk every distinct match (not just the first one,
+    # repeatedly) until one looks like a plausible price.
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    visible_text = soup.get_text(separator=" ")
+
     sym_pattern = "|".join(re.escape(s) for s in allowed_symbols)
     price_pattern = re.compile(
         rf'({sym_pattern})\s*[\d,]+(?:\.\d{{1,2}})?',
         re.IGNORECASE
     )
-    for match in list(price_pattern.finditer(html))[:10]:
+    for match in list(price_pattern.finditer(visible_text))[:10]:
         candidate = match.group(0).strip()
         digits = re.sub(r'[^\d.]', '', candidate)
         try:

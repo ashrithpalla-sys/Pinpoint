@@ -128,6 +128,25 @@ class TestExtractPriceFromHtml:
         html = "Insurance surcharge $999999 — actual price today: $59.99"
         assert MAIN.extract_price_from_html(html, ["$", "USD"]) == "$59.99"
 
+    def test_ignores_dollar_patterns_inside_script_tags(self):
+        # regression: real product pages (e.g. a North Face jacket on JD
+        # Sports) contain minified JS with "$"-shaped patterns that aren't
+        # prices at all -- e.g. .replace(x, "$1$2") regex-backreference
+        # syntax. "$1" was rejected by the "> 1" bound but "$2" right after
+        # it slipped through and got returned as "the price" for a jacket.
+        html = """
+        <script>function f(e,t){return e.replace(t,"$1$2")}</script>
+        <div>No visible price on this page.</div>
+        """
+        assert MAIN.extract_price_from_html(html, ["$", "USD"]) is None
+
+    def test_finds_real_price_alongside_script_noise(self):
+        html = """
+        <script>function f(e,t){return e.replace(t,"$1$2")}</script>
+        <div>Now only $79.99</div>
+        """
+        assert MAIN.extract_price_from_html(html, ["$", "USD"]) == "$79.99"
+
     def test_malformed_json_ld_does_not_crash(self):
         html = """
         <script type="application/ld+json">{not valid json}</script>
